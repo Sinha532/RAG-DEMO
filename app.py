@@ -1,0 +1,342 @@
+"""
+Healthcare RAG Chatbot
+Main Streamlit application with SQL database queries using Google AI
+"""
+
+import streamlit as st
+import os
+import pandas as pd
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from dotenv import load_dotenv
+import tempfile
+
+from database import (
+    create_patient_database, 
+    query_database, 
+    get_patient_info, 
+    get_database_schema
+)
+from pdf_rag import create_pdf_rag_system
+
+# Load environment variables
+load_dotenv()
+
+# Page configuration
+st.set_page_config(
+    page_title="Healthcare RAG Chatbot",
+    page_icon="🏥",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Initialize session state
+if 'db_initialized' not in st.session_state:
+    st.session_state.db_initialized = False
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+if 'show_schema' not in st.session_state:
+    st.session_state.show_schema = False
+if 'show_samples' not in st.session_state:
+    st.session_state.show_samples = False
+if 'db_schema_cache' not in st.session_state:
+    st.session_state.db_schema_cache = None
+if 'sample_patients_cache' not in st.session_state:
+    st.session_state.sample_patients_cache = None
+if 'pdf_rag_initialized' not in st.session_state:
+    st.session_state.pdf_rag_initialized = False
+if 'pdf_rag_system' not in st.session_state:
+    st.session_state.pdf_rag_system = None
+
+# Load API keys
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+MISTRAL_API_KEY = os.getenv('MISTRAL_API_KEY')
+
+# Validate API keys
+if not GOOGLE_API_KEY:
+    st.error("❌ GOOGLE_API_KEY not found. Please set it in your .env file.")
+    st.stop()
+
+if not MISTRAL_API_KEY:
+    st.error("❌ MISTRAL_API_KEY not found. Please set it in your .env file.")
+    st.stop()
+
+# Initialize Google Gemini LLM for SQL queries
+@st.cache_resource
+def initialize_google_llm():
+    """Initialize Google Gemini LLM"""
+    return ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        google_api_key=GOOGLE_API_KEY,
+        temperature=0.3,
+        convert_system_message_to_human=True
+    )
+
+gemini_llm = initialize_google_llm()
+
+# SQL Query Prompt Template
+sql_prompt = ChatPromptTemplate.from_template(
+    """
+    You are a SQL expert working with a patient healthcare database.
+    
+    Given the following database schema:
+    {schema}
+    
+    And the user's question:
+    {question}
+    
+    Generate a valid SQLite query to answer the question.
+    Return ONLY the SQL query, nothing else.
+    
+    Important rules:
+    - Use proper SQLite syntax
+    - Do NOT use markdown formatting or code blocks
+    - Return only the raw SQL query
+    - Use appropriate JOINs when needed
+    - Handle date formatting properly
+    
+    SQL Query:
+    """
+)
+
+# Natural Language Response Prompt
+response_prompt = ChatPromptTemplate.from_template(
+    """
+    Based on the following database query results, provide a clear and concise answer to the user's question.
+    
+    User Question: {question}
+    
+    Query Results:
+    {results}
+    
+    Provide a natural language response that directly answers the question.
+    If the results are empty, inform the user that no matching records were found.
+    
+    Answer:
+    """
+)
+
+
+def generate_sql_query(question: str, schema: str) -> str:
+    """Generate SQL query from natural language question"""
+    chain = sql_prompt | gemini_llm
+    response = chain.invoke({
+        "schema": schema,
+        "question": question
+    })
+    query = response.content.strip()
+    
+    # Clean up query
+    query = query.replace("``````", "").strip()
+    
+    return query
+
+
+def generate_natural_response(question: str, results: pd.DataFrame) -> str:
+    """Generate natural language response from query results"""
+    chain = response_prompt | gemini_llm
+    
+    # Convert DataFrame to string
+    if results.empty:
+        results_str = "No results found"
+    else:
+        results_str = results.to_string()
+    
+    response = chain.invoke({
+        "question": question,
+        "results": results_str
+    })
+    
+    return response.content
+
+
+def handle_sql_query(question: str):
+    """Handle SQL database queries"""
+    try:
+        # Get schema
+        if st.session_state.db_schema_cache is None:
+            st.session_state.db_schema_cache = get_database_schema()
+        
+        schema = st.session_state.db_schema_cache
+        
+        # Generate SQL query
+        with st.spinner("🔍 Generating SQL query..."):
+            sql_query = generate_sql_query(question, schema)
+        
+        st.code(sql_query, language="sql")
+        
+        # Execute query
+        with st.spinner("📊 Executing query..."):
+            results = query_database(sql_query)
+        
+        # Display results
+        if isinstance(results, pd.DataFrame) and not results.empty:
+            st.dataframe(results, use_container_width=True)
+            
+            # Generate natural language response
+            with st.spinner("✍️ Generating response..."):
+                nl_response = generate_natural_response(question, results)
+            
+            return nl_response
+        elif isinstance(results, pd.DataFrame) and results.empty:
+            return "No matching records found in the database."
+        else:
+            return f"Query execution error: {results}"
+            
+    except Exception as e:
+        return f"Error processing SQL query: {str(e)}"
+
+
+def handle_pdf_query(question: str):
+    """Handle PDF document queries"""
+    try:
+        if not st.session_state.pdf_rag_initialized:
+            return "⚠️ Please upload and process a PDF document first."
+        
+        with st.spinner("🔍 Searching PDF documents..."):
+            response = st.session_state.pdf_rag_system.query(question)
+        
+        answer = response.get('answer', 'No answer found.')
+        
+        # Display source documents if available
+        if 'context' in response:
+            with st.expander("📄 Source Documents"):
+                for i, doc in enumerate(response['context'], 1):
+                    st.markdown(f"**Document {i}:**")
+                    st.text(doc.page_content[:500] + "...")
+                    st.divider()
+        
+        return answer
+        
+    except Exception as e:
+        return f"Error processing PDF query: {str(e)}"
+
+
+# Streamlit UI
+st.title("🏥 Healthcare RAG Chatbot")
+st.markdown("**Built with LangChain, Google Gemini & Mistral AI | Powered by FAISS & SQLite**")
+
+# Sidebar
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    
+    # Database initialization
+    st.subheader("📊 Database Setup")
+    if st.button("🔄 Initialize/Reset Database", use_container_width=True):
+        with st.spinner("Creating database..."):
+            result = create_patient_database()
+            st.success(result)
+            st.session_state.db_initialized = True
+            st.session_state.db_schema_cache = get_database_schema()
+            st.session_state.sample_patients_cache = get_patient_info()
+    
+    # Show database info
+    if st.session_state.db_initialized or os.path.exists('patients.db'):
+        if st.button("📋 Show Database Schema", use_container_width=True):
+            st.session_state.show_schema = not st.session_state.show_schema
+        
+        if st.button("👥 Show Sample Patients", use_container_width=True):
+            st.session_state.show_samples = not st.session_state.show_samples
+    
+    st.divider()
+    
+    # PDF Upload
+    st.subheader("📄 PDF Document Upload")
+    uploaded_file = st.file_uploader("Upload PDF for RAG", type=['pdf'])
+    
+    if uploaded_file is not None:
+        if st.button("🚀 Process PDF", use_container_width=True):
+            with st.spinner("Processing PDF with Mistral AI..."):
+                try:
+                    # Save uploaded file temporarily
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+                        tmp_file.write(uploaded_file.getvalue())
+                        tmp_path = tmp_file.name
+                    
+                    # Initialize PDF RAG system
+                    if st.session_state.pdf_rag_system is None:
+                        st.session_state.pdf_rag_system = create_pdf_rag_system(MISTRAL_API_KEY)
+                    
+                    # Process PDF
+                    st.session_state.pdf_rag_system.process_pdf(tmp_path)
+                    st.session_state.pdf_rag_initialized = True
+                    
+                    # Clean up
+                    os.unlink(tmp_path)
+                    
+                    st.success("✅ PDF processed successfully!")
+                    
+                except Exception as e:
+                    st.error(f"❌ Error processing PDF: {str(e)}")
+    
+    st.divider()
+    
+    # Query mode selection
+    st.subheader("🎯 Query Mode")
+    query_mode = st.radio(
+        "Select query type:",
+        ["SQL Database", "PDF Documents"],
+        help="Choose whether to query the patient database or uploaded PDF documents"
+    )
+    
+    st.divider()
+    
+    # Clear chat
+    if st.button("🗑️ Clear Chat History", use_container_width=True):
+        st.session_state.chat_history = []
+        st.rerun()
+
+# Display schema if toggled
+if st.session_state.show_schema:
+    with st.expander("📋 Database Schema", expanded=True):
+        if st.session_state.db_schema_cache is None:
+            st.session_state.db_schema_cache = get_database_schema()
+        st.code(st.session_state.db_schema_cache)
+
+# Display sample patients if toggled
+if st.session_state.show_samples:
+    with st.expander("👥 Sample Patients", expanded=True):
+        if st.session_state.sample_patients_cache is None:
+            st.session_state.sample_patients_cache = get_patient_info()
+        st.dataframe(st.session_state.sample_patients_cache, use_container_width=True)
+
+# Display chat history
+st.subheader("💬 Chat History")
+for message in st.session_state.chat_history:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        
+        # Display dataframe if present
+        if "dataframe" in message:
+            st.dataframe(message["dataframe"], use_container_width=True)
+
+# Chat input
+if prompt := st.chat_input("Ask a question..."):
+    # Add user message to chat
+    st.session_state.chat_history.append({"role": "user", "content": prompt})
+    
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    
+    # Generate response based on mode
+    with st.chat_message("assistant"):
+        if query_mode == "SQL Database":
+            response = handle_sql_query(prompt)
+        else:
+            response = handle_pdf_query(prompt)
+        
+        st.markdown(response)
+    
+    # Add assistant response to chat
+    st.session_state.chat_history.append({"role": "assistant", "content": response})
+
+# Footer
+st.divider()
+st.markdown(
+    """
+    <div style='text-align: center; color: gray;'>
+    <p>🏥 Healthcare RAG Chatbot | Google Gemini for SQL | Mistral AI for PDFs</p>
+    </div>
+    """,
+    unsafe_allow_html=True
+)

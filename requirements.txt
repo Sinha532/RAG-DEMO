@@ -1,0 +1,30 @@
+# Core dependencies
+streamlit==1.31.0
+python-dotenv==1.0.1
+pandas==2.2.0
+
+# LangChain core
+langchain==0.1.10
+langchain-core==0.1.27
+langchain-community==0.0.24
+
+# Google AI
+langchain-google-genai==0.0.11
+google-generativeai==0.3.2
+
+# Mistral AI
+langchain-mistralai==0.0.5
+mistralai==0.1.6
+
+# Document processing
+pypdf==4.0.1
+pypdf2==3.0.1
+
+# Vector store
+faiss-cpu==1.7.4
+
+# Database
+sqlite3
+
+# Text splitting
+tiktoken==0.6.0
